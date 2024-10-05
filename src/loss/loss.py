@@ -1,6 +1,31 @@
 import torch
 
 
+def calc_epipolar_loss(loss, projs, weights, h, w, n_epipolar):
+    """
+        Calculate epipolar consistency loss.
+    """
+    # projs = projs.reshape(n_epipolar, 4, -1)
+    # l1_upper = projs[:, 0, :]
+    # l1_lower = projs[:, 1, :]
+    # l2_upper = projs[:, 2, :]
+    # l2_lower = projs[:, 3, :]
+    # l1_integral_grad = (torch.sum(l1_upper * drs[:,0], dim=1) - torch.sum(l1_lower * drs[:,1], dim=1)) / (2 * h)
+    # l2_integral_grad = (torch.sum(l2_upper * drs[:,0], dim=1) - torch.sum(l2_lower * drs[:,1], dim=1)) / (2 * h)
+
+    l1_upper, l1_lower, l2_upper, l2_lower = projs
+    w1_upper, w1_lower, w2_upper, w2_lower = weights
+
+    l1_integral_grad = (torch.sum(l1_upper * w1_upper) - torch.sum(l1_lower * w1_lower)) / (2 * h)
+    l2_integral_grad = (torch.sum(l2_upper * w2_upper) - torch.sum(l2_lower * w2_lower)) / (2 * h)
+
+    loss_epipolar = torch.mean((l1_integral_grad - l2_integral_grad) ** 2)
+
+    loss["loss"] += w * loss_epipolar
+    loss["loss_epipolar"] = loss_epipolar
+    return loss
+
+
 def calc_mse_loss(loss, x, y):
     """
     Calculate mse loss.

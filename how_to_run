@@ -1,0 +1,11 @@
+1. Used CUDA 11.7 (not sure necessary)
+2. export TORCH_CUDA_ARCH_LIST="8.9+PTX"
+had to change cpp_extensions.py file in torch to include the new arch:
+
+#line 1748
+        ('Ampere', '8.0;8.6+PTX'),
+        ('Ada', '8.9+PTX'),
+    ])
+
+    supported_arches = ['3.5', '3.7', '5.0', '5.2', '5.3', '6.0', '6.1', '6.2',
+                        '7.0', '7.2', '7.5', '8.0', '8.6', '8.9']

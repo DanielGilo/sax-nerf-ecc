@@ -17,6 +17,8 @@ from .network import get_network
 from .encoder import get_encoder
 from pdb import set_trace as stx
 
+import wandb
+
 
 class Trainer:
     def __init__(self, cfg, device="cuda"):
@@ -35,7 +37,9 @@ class Trainer:
         # Log direcotry，设置实验路径和文件夹
         date_time = str(datetime.datetime.now())
         date_time = time2file_name(date_time)
-        self.expdir = osp.join(cfg["exp"]["expdir"], cfg["exp"]["expname"], date_time)
+        specific_expname = "ecc_w={}_ecc_start={}".format(cfg["train"]["epipolar_loss_weight"],
+                                                          cfg["train"]["epipolar_start_epoch"])
+        self.expdir = osp.join(cfg["exp"]["expdir"], cfg["exp"]["expname"], specific_expname)
         self.ckptdir = osp.join(self.expdir, "ckpt.tar")
         self.ckptdir_backup = osp.join(self.expdir, "ckpt_backup.tar")
         self.ckpt_best_dir = osp.join(self.expdir, "ckpt_best.tar")
@@ -56,11 +60,14 @@ class Trainer:
             还没有被拍扁
         '''
         # train_dset = Dataset(cfg["exp"]["datadir"], cfg["train"]["n_rays"], "train", device) # 由dataset去构造数据集
-        train_dset = Dataset_MLG(cfg["exp"]["datadir"], cfg["train"]["n_rays"], "train", cfg["train"]["window_size"], cfg["train"]["window_num"], device) # 由dataset去构造数据集
+        self.train_dset = Dataset_MLG(cfg["exp"]["datadir"], cfg["train"]["n_rays"], "train", cfg["train"]["window_size"], cfg["train"]["window_num"], device) # 由dataset去构造数据集
         # stx()
         self.eval_dset = Dataset(cfg["exp"]["datadir"], cfg["train"]["n_rays"], "val", device) if self.i_eval > 0 else None
-        self.train_dloader = torch.utils.data.DataLoader(train_dset, batch_size=cfg["train"]["n_batch"]) # 官方的 data_loader 的作用知识分一个batch
+        self.train_dloader = torch.utils.data.DataLoader(self.train_dset, batch_size=cfg["train"]["n_batch"]) # 官方的 data_loader 的作用知识分一个batch
         self.voxels = self.eval_dset.voxels if self.i_eval > 0 else None
+
+        # Daniel
+        self.epipolar_n_samples = self.train_dset.geo.nDetector[1]
     
         # Network，实例化网络
         network = get_network(cfg["network"]["net_type"])
@@ -85,6 +92,11 @@ class Trainer:
         self.lr_scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer=self.optimizer, step_size=cfg["train"]["lrate_step"], gamma=cfg["train"]["lrate_gamma"])
 
+        # Daniel: loss
+        self.epipolar_loss_weight = float(cfg["train"]["epipolar_loss_weight"])
+        self.epipolar_start_epoch = cfg["train"]["epipolar_start_epoch"]
+        self.epipolar_h = float(cfg["train"]["epipolar_h"])
+
         # Load checkpoints
         self.epoch_start = 0
         if cfg["train"]["resume"] and osp.exists(self.ckptdir):
@@ -100,6 +112,21 @@ class Trainer:
         # Summary writer 需要用tensorboard打开来看，不如直接就txt文件记录
         self.writer = SummaryWriter(self.expdir)
         self.writer.add_text("parameters", self.args2string(cfg), global_step=0)
+
+        # wandb
+
+        wandb.init(
+            # set the wandb project where this run will be logged
+            project="sax-nerf-ecc",
+
+            # track hyperparameters and run metadata
+            config=cfg,
+
+            group=cfg["exp"]["expname"],
+
+            name="{}_ecc_w={}_ecc_start={}".format(cfg["exp"]["expname"], cfg["train"]["epipolar_loss_weight"],
+                                                   self.epipolar_start_epoch)
+        )
 
     def args2string(self, hp):
         """
@@ -130,6 +157,8 @@ class Trainer:
                 self.net.train()
                 tqdm.write(f"[EVAL] epoch: {idx_epoch}/{self.epochs}{fmt_loss_str(loss_test)}")  # 此处为何不报PSNR？
                 self.logger.info(f"[EVAL] epoch: {idx_epoch}/{self.epochs}{fmt_loss_str(loss_test)}")
+
+                wandb.log({"eval/loss": loss_test})
             
             # Train
             # stx()
@@ -137,12 +166,20 @@ class Trainer:
                 self.global_step += 1
                 # Train
                 self.net.train()
-                loss_train = self.train_step(data, global_step=self.global_step, idx_epoch=idx_epoch)
-                pbar.set_description(f"epoch={idx_epoch}/{self.epochs}, loss={loss_train:.4g}, lr={self.optimizer.param_groups[0]['lr']:.4g}")
+                loss_train, loss_dict = self.train_step(data, global_step=self.global_step, idx_epoch=idx_epoch)
+                pbar.set_description(f"epoch={idx_epoch}/{self.epochs}," 
+                                     f"loss_mse={loss_dict['loss_mse']:.4g},"
+                                     f"epipolar_loss ={loss_dict['loss_mse']:.4g},"
+                                     f"lr={self.optimizer.param_groups[0]['lr']:.4g}")
                 pbar.update(1)
+
+                wandb.log(loss_dict)
             
             if idx_epoch % 10 == 0:
-                self.logger.info(f"epoch={idx_epoch}/{self.epochs}, loss={loss_train:.4g}, lr={self.optimizer.param_groups[0]['lr']:.4g}")
+                self.logger.info(f"epoch={idx_epoch}/{self.epochs}," 
+                                 f"loss={loss_dict['loss_mse']:.4g},"
+                                 f"epipolar_loss ={loss_dict['loss_mse']:.4g},"
+                                 f"lr={self.optimizer.param_groups[0]['lr']:.4g}")
             
             # Save
             if (idx_epoch % self.i_save == 0 or idx_epoch == self.epochs) and self.i_save > 0 and idx_epoch > 0:
@@ -172,11 +209,11 @@ class Trainer:
         Training step
         """
         self.optimizer.zero_grad()
-        loss = self.compute_loss(data, global_step, idx_epoch)
+        loss, loss_dict = self.compute_loss(data, global_step, idx_epoch)
         loss.backward()
         self.optimizer.step()
-        return loss.item()
-    
+        return loss.item(), loss_dict
+
     # 下面两个函数在父类中不作定义，在子类中进行重写
 
     def compute_loss(self, data, global_step, idx_epoch):

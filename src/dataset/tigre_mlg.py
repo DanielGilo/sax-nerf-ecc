@@ -7,6 +7,8 @@ import numpy as np
 from torch.utils.data import DataLoader, Dataset
 from pdb import set_trace as stx
 
+from tigre.utilities.geometry import Geometry # Daniel
+
 
 '''
     将整个像素坐标空间对应的像素值即 projection: [b, 256, 256] 划分成 [bx8x8, 32, 32]
@@ -39,7 +41,8 @@ def ray_window_partition(x, window_size):
 
 
 # 这里的各项参数代表的物理含义可以在哪查到呢？
-class ConeGeometry(object):
+#class ConeGeometry(object):
+class ConeGeometry(Geometry):
     """
     Cone beam CT geometry. Note that we convert to meter from millimeter. 1 m = 1000 mm
     """
@@ -90,6 +93,8 @@ class TIGREDataset_MLG(Dataset):
         self.n_rays = n_rays
         self.near, self.far = self.get_near_far(self.geo)
 
+        self.intrinsics_mat = self.get_intrinsics_mat() # Daniel
+
         if type == "train":
             self.projs = torch.tensor(data["train"]["projections"], dtype=torch.float32, device=device) # [50, 256, 256]
             angles = data["train"]["angles"]                    # [50]
@@ -112,6 +117,11 @@ class TIGREDataset_MLG(Dataset):
             self.image = torch.tensor(data["image"], dtype=torch.float32, device=device)                 # [128, 128, 128]
             self.voxels = torch.tensor(self.get_voxels(self.geo), dtype=torch.float32, device=device)   # [128, 128, 128, 3]
 
+            self.extrinsics_mats = torch.stack(
+                [torch.Tensor(np.linalg.inv(self.angle2pose(self.geo.DSO, angle))) for angle in angles],
+                dim=0)  # Daniel
+            self.angles = angles  # Daniel
+
         elif type == "val":
             self.projs = torch.tensor(data["val"]["projections"], dtype=torch.float32, device=device)
             angles = data["val"]["angles"]
@@ -120,7 +130,12 @@ class TIGREDataset_MLG(Dataset):
             self.n_samples = data["numVal"]
             self.image = torch.tensor(data["image"], dtype=torch.float32, device=device)
             self.voxels = torch.tensor(self.get_voxels(self.geo), dtype=torch.float32, device=device)
-        
+
+            self.extrinsics_mats = torch.stack(
+                [torch.Tensor(np.linalg.inv(self.angle2pose(self.geo.DSO, angle))) for angle in angles],
+                dim=0)  # Daniel
+            self.angles = angles  # Daniel
+
     def __len__(self):
         return self.n_samples       # 还是五十个sample
 
@@ -342,3 +357,12 @@ class TIGREDataset_MLG(Dataset):
         near = np.max([0, geo.DSO - dist_max - tolerance])
         far = np.min([geo.DSO * 2, geo.DSO + dist_max + tolerance])
         return near, far
+
+    def get_intrinsics_mat(self):
+        geo = self.geo
+        f = geo.DSD
+        (dx, dy) = geo.dDetector
+        u0 = (geo.nDetector[0] // 2 - 0.5)
+        v0 = (geo.nDetector[1] // 2 - 0.5)
+        K = torch.Tensor([[f / dx, 0, u0, 0], [0, f / dy, v0, 0], [0, 0, 1, 0]])
+        return K

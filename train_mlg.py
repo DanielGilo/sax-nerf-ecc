@@ -6,10 +6,12 @@ from tqdm import tqdm
 import numpy as np
 import argparse
 
+import wandb
+
 def config_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="./config/Lineformer/chest_50.yaml",help="configs file path")
-    parser.add_argument("--gpu_id", default="1", help="gpu to use")
+    parser.add_argument("--gpu_id", default="0", help="gpu to use")
     return parser
 
 parser = config_parser()
@@ -21,8 +23,9 @@ os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
 from src.config.configloading import load_config
 from src.render import render, run_network
 from src.trainer_mlg import Trainer
-from src.loss import calc_mse_loss
+from src.loss import calc_mse_loss, calc_epipolar_loss
 from src.utils import get_psnr, get_mse, get_psnr_3d, get_ssim_3d, cast_to_image, get_ssim
+from src.utils.epipolar_utils import get_random_epipolar_rays
 from pdb import set_trace as stx
 
 
@@ -53,14 +56,30 @@ class BasicTrainer(Trainer):
         # stx()
         projs_pred = ret["acc"]
 
+        # Daniel
+        n_epipolar = 1
+        epipolar_dset = self.train_dset
+        epi_rays, epi_weights = get_random_epipolar_rays(
+            epipolar_dset, n_epipolar, h=self.epipolar_h, n_samples=self.epipolar_n_samples)
+        epi_projs = render(epi_rays.reshape(-1, 8), self.net, self.net_fine, **self.conf["render"])[
+            "acc"]  # (4*epipolar_n_samples, 1)
+        epi_projs = epi_projs.reshape(4, -1)  # (4, epipolar_n_samples)
+        epi_weights = epi_weights.to(device)
+
+
         loss = {"loss": 0.}
         calc_mse_loss(loss, projs, projs_pred)
+
+        # Daniel
+        w = self.epipolar_loss_weight * (
+                    idx_epoch >= self.epipolar_start_epoch)  # start optimizing epipolar loss only from given epoch
+        calc_epipolar_loss(loss, epi_projs, epi_weights, self.epipolar_h, w, n_epipolar)
 
         # Log
         for ls in loss.keys():
             self.writer.add_scalar(f"train/{ls}", loss[ls].item(), global_step)
 
-        return loss["loss"]
+        return loss["loss"], loss
 
     def eval_step(self, global_step, idx_epoch):
         """
@@ -102,7 +121,7 @@ class BasicTrainer(Trainer):
             self.logger.info(f"best model update, epoch:{idx_epoch}, best 3d psnr:{self.best_psnr_3d:.4g}")
 
         # Logging
-        show_slice = 5
+        show_slice = 4 # 5
         show_step = image.shape[-1]//show_slice
         show_image = image[...,::show_step]
         show_image_pred = image_pred[...,::show_step]
@@ -110,6 +129,8 @@ class BasicTrainer(Trainer):
         for i_show in range(show_slice):
             show.append(torch.concat([show_image[..., i_show], show_image_pred[..., i_show]], dim=0))
         show_density = torch.concat(show, dim=1)
+
+        show_proj = torch.concat([projs, projs_pred], dim=1)
 
         # cast_to_image -> 转成 numpy并多加一个维度
         self.writer.add_image("eval/density (row1: gt, row2: pred)", cast_to_image(show_density), global_step, dataformats="HWC")
@@ -135,6 +156,12 @@ class BasicTrainer(Trainer):
 
         for ls in loss.keys():
             self.writer.add_scalar(f"eval/{ls}", loss[ls], global_step)
+
+            # wandb
+        density_slice = wandb.Image(cast_to_image(show_density), caption="Top: GT, Bottom: Pred")
+        #projections = wandb.Image(cast_to_image(show_proj), caption="Top: GT, Bottom: Pred")
+        wandb.log({"density": density_slice})
+                        #, "projections": projections})
             
         # Save
         # 保存各种视图
